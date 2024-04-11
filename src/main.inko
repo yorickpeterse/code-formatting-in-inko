@@ -1,0 +1,378 @@
+# A basic example of writing a code formatter using Inko.
+#
+# The implementation shown here is a simplified version of Inko's own code
+# formatter, which is based on Prettier (https://prettier.io/) and the paper "A
+# prettier printer" by Philip Wadler.
+import std.env
+import std.int (Format)
+import std.set (Set)
+import std.stdio (STDOUT)
+import std.string (IntoString, StringBuffer)
+
+# The character(s) to use for indenting code. You can change this to anything
+# you like (e.g. '\t', '>>', or something else).
+let INDENT = '  '
+
+# The creatively named "Node" type is the foundation of our formatter. In a
+# typical compiler you'd take your AST/whatever and lower it into a tree
+# consisting of these "Node" types. We then generate the formatted code by
+# converting a "Node" tree into a "String", which we then write to the
+# destination (a file, STDOUT, etc).
+class enum Node {
+  # A "Group" is a collection of nodes that the formatter tries to squeeze on
+  # the current line. If the nodes don't all fit on the line, they are wrapped
+  # across lines.
+  #
+  # Each group has a unique ID (per file that you're formatting), which is what
+  # the first `Int` argument is for.
+  case Group(Int, Array[Node])
+
+  # "Nodes" is similar to "Group" in that it contains a collection of nodes, but
+  # unlike "Group" we don't try to fit them on a single line, instead we just
+  # render them as-is.
+  #
+  # The reason "Nodes" exists is because there are various scenarios in which a
+  # helper function of sorts may produce multiple nodes and you just want to
+  # concatenate them with whatever you've produced thus far. Using a dedicated
+  # "Nodes" case makes this a little easier compared to something along the
+  # lines of `existing_data.concat(nodes)`, or having to pass mutable references
+  # around to the list of existing nodes you wish to push the helper's nodes
+  # into.
+  case Nodes(Array[Node])
+
+  # This case checks a group ID (the `Int` argument), and decides which node
+  # should be rendered: if the group ID is of a group that doesn't fit on a
+  # single line, we render the first `Node` argument. If the group does fit on a
+  # single line, render the second `Node` argument instead. So given
+  # `IfWrap(10, a, b)`, this translates to the following logic:
+  #
+  #     if group widh ID 10 is wrapped { a } else { b }
+  #
+  # This node is useful for conditional formatting, such as trailing commas in
+  # arrays or argument lists.
+  case IfWrap(Int, Node, Node)
+
+  # This node is used for ASCII text.
+  #
+  # For Unicode text the width is the number of extended grapheme clusters, not
+  # the number of bytes. Calculating that number is an O(n) operation, so we
+  # perform that calculation once and cache it for Unicode text. For ASCII text
+  # this isn't needed, as we can just derive it from the string's byte size.
+  case Text(String)
+
+  # Text that contains multibyte characters.
+  #
+  # The `String` argument is the textual value, while the `Int` argument
+  # specifies the width as the number of extended grapheme clusters.
+  case Unicode(String, Int)
+
+  # A node that renders as a space when inside a group that fits on a single
+  # line, otherwise it renders as a new line.
+  case SpaceOrLine
+
+  # A node that renders as a new line when inside a group that needs to be
+  # wrapped, otherwise it doesn't render to anything at all.
+  case Line
+
+  # A node that renders the given nodes. If this node resides in a group that
+  # needs to be wrapped, each new line is automatically indented.
+  case Indent(Array[Node])
+
+  # Returns a new `Node.Unicode` node with its cached width.
+  #
+  # While in this example we only use this method in one place, in a typical
+  # formatter you'll see more use of it, so it's helpful to put it in a separate
+  # method.
+  fn static unicode(value: String) -> Node {
+    Node.Unicode(value, value.chars.count)
+  }
+
+  # Returns the width of `self`.
+  #
+  # The `wrapped` argument is a hash set that contains the IDs of any groups
+  # that need to be wrapped.
+  #
+  # We can't cache the width of entire groups, as the width of a sub group may
+  # differ based on whether it needs to be wrapped or not. Take this code for
+  # example:
+  #
+  #     [10]
+  #
+  # The width of this example as-is is 4 characters. Now imagine that based on
+  # the wrapping needs of some parent group we want to render this as follows
+  # instead:
+  #
+  #     [10,]
+  #
+  # In this case the width is 5 characters. If we perform the width calculation
+  # once and cache the results, we'd end up with a width of 4 (as we don't yet
+  # know what groups need wrapping), which can result in certain code exceeding
+  # the line limit. In the setup shown here this may not be necessary, but in a
+  # real formatter you'll run into scenarios where this _does_ matter.
+  fn width(wrapped: ref Set[Int]) -> Int {
+    match self {
+      case Nodes(nodes) or Group(_, nodes) or Indent(nodes) -> {
+        Int.sum(nodes.iter.map(fn (n) { n.width(wrapped) }))
+      }
+      case IfWrap(id, node, _) if wrapped.contains?(id) -> node.width(wrapped)
+      case IfWrap(_, _, node) -> node.width(wrapped)
+      case Text(str) -> str.size
+      case Unicode(_, chars) -> chars
+      case SpaceOrLine -> 1
+      case _ -> 0
+    }
+  }
+}
+
+# The "Wrap" type is used to signal whether wrapping is necessary or not. Inko's
+# formatter has two extra cases: "Disable" and "Force". The first is used to
+# disable wrapping inside string interpolation expressions, the second is used
+# to force wrapping in certain cases. Both are left out for the sake of
+# simplicity.
+class enum Wrap {
+  case Enable
+  case Detect
+
+  fn enable? -> Bool {
+    match self {
+      case Enable -> true
+      case _ -> false
+    }
+  }
+}
+
+# This is the type used for converting a Node tree into a String, along with
+# tracking whatever state is necessary for this.
+class Generator {
+  # This field is the buffer we'll write our formatted code into.
+  let @buffer: StringBuffer
+
+  # This field tracks the indentation levels, not the number of indentation
+  # characters (i.e. if you use 2 spaces for indentation, you increment this
+  # field by one).
+  let @indent: Int
+
+  # The number of characters/extended grapheme clusters on the current line.
+  let @size: Int
+
+  # The maximum number of characters we allow per line. If your formatter
+  # doesn't users to change this value, you probably want to turn this into a
+  # constant instead.
+  let @max: Int
+
+  # A hash set containing all the groups that need to be wrapped.
+  let @wrapped: Set[Int]
+
+  # This method returns a new `Generator` in its default state, using `max` as
+  # the line limit.
+  fn static new(max: Int) -> Generator {
+    Generator {
+      @buffer = StringBuffer.new,
+      @indent = 0,
+      @size = 0,
+      @max = max,
+      @wrapped = Set.new,
+    }
+  }
+
+  # The entry point for generating the formatted code for a single node. This is
+  # the method you'd call when lowering an AST into a Node tree.
+  fn mut generate(node: Node) {
+    node(node, ref Wrap.Detect)
+  }
+
+  # This method renders a single node. The implementation uses a recursive
+  # algorithm instead of an iterative one, as this is easier to wrap your head
+  # around and most Node trees aren't that deeply nested to begin with. Even if
+  # they are, the amount of stack space needed per call is minimal.
+  fn mut node(node: Node, wrap: ref Wrap) {
+    match node {
+      case Nodes(nodes) -> nodes.into_iter.each(fn (n) { node(n, wrap) })
+      case Group(id, nodes) -> {
+        # First we need to calculate the width of our nodes.
+        let width = Int.sum(nodes.iter.map(fn (n) { n.width(@wrapped) }))
+
+        # Now that we know the width, we can calculate if we have enough
+        # remaining space to fit our group on the current line. If not, we
+        # enable wrapping and track the current group in the "wrapped" hash set,
+        # so any nested "IfWrap" nodes work correctly.
+        let wrap = if @size + width > @max {
+          @wrapped.insert(id)
+          Wrap.Enable
+        } else {
+          Wrap.Detect
+        }
+
+        nodes.into_iter.each(fn (n) { node(n, wrap) })
+      }
+      case IfWrap(id, node, _) if @wrapped.contains?(id) -> {
+        node(node, Wrap.Enable)
+      }
+      case IfWrap(_, _, node) -> node(node, wrap)
+      case Text(str) -> text(str, str.size)
+      case Unicode(str, width) -> text(str, width)
+      case Line if wrap.enable? -> new_line
+      case SpaceOrLine if wrap.enable? -> new_line
+      case SpaceOrLine -> text(' ', chars: 1)
+      case Indent(nodes) if wrap.enable? -> {
+        # For the line size we need to add the number of _characters_ the
+        # indentation string takes up, not the amount of indentation levels.
+        @size += INDENT.size
+        @indent += 1
+        @buffer.push(INDENT)
+        nodes.into_iter.each(fn (n) { node(n, wrap) })
+        @indent -= 1
+      }
+      case Indent(nodes) -> nodes.into_iter.each(fn (n) { node(n, wrap) })
+      case _ -> {}
+    }
+  }
+
+  fn mut text(value: String, chars: Int) {
+    @size += chars
+    @buffer.push(value)
+  }
+
+  fn mut new_line {
+    # Each line starts with the appropriate amount of indentation, so we need to
+    # set the new line size accordingly.
+    @size = INDENT.size * @indent
+    @buffer.push('\n')
+    @indent.times(fn (_) { @buffer.push(INDENT) })
+  }
+}
+
+impl IntoString for Generator {
+  fn pub move into_string -> String {
+    @buffer.into_string
+  }
+}
+
+# This type is a helper type for constructing complex nodes. In a typical
+# compiler you'd have one method for each AST node type you wish to lower into
+# a Node tree. So for strings you'd have a `string` method, `int` for integers,
+# `call` for method/function calls, etc.
+class Builder {
+  # This field tracks the next group ID to use, starting with zero.
+  let @id: Int
+
+  fn static new -> Builder {
+    Builder { @id = 0 }
+  }
+
+  # An example method for formatting a simple function call with zero or more
+  # arguments.
+  fn mut call(name: String, arguments: Array[Node]) -> Node {
+    let id = new_id
+
+    # If there are no arguments we can skip all the code below.
+    if arguments.empty? {
+      return Node.Group(id, [Node.Text(name), Node.Text('()')])
+    }
+
+    let max = arguments.size - 1
+
+    # This builds a comma separated list of argument nodes. The last argument is
+    # followed by a comma that's only shown when the argument list doesn't fit
+    # on a single line.
+    let vals = arguments
+      .into_iter
+      .with_index
+      .map(fn (index_and_node) {
+        match index_and_node {
+          case (index, node) if index < max -> {
+            Node.Nodes([node, Node.Text(','), Node.SpaceOrLine])
+          }
+          case (_, node) -> {
+            Node.Nodes([node, Node.IfWrap(id, Node.Text(','), Node.Text(''))])
+          }
+        }
+      })
+      .to_array
+
+    Node.Group(
+      id,
+      [
+        Node.Text(name),
+        Node.Group(
+          new_id,
+          [
+            Node.Text('('),
+            Node.Line,
+            Node.Indent(vals),
+            Node.Line,
+            Node.Text(')'),
+          ],
+        ),
+      ],
+    )
+  }
+
+  # This method generates a node for a simple double quoted string. In a real
+  # formatter you'll also want to take care of escape sequences, escaping any
+  # inner double quotes, etc.
+  fn mut string(value: String) -> Node {
+    Node.Group(new_id, [Node.Text('"'), Node.unicode(value), Node.Text('"')])
+  }
+
+  # This method increments the "id" field and returns its previous value (that's
+  # what the `:=` is for, instead of a regular `=`).
+  fn mut new_id -> Int {
+    @id := @id + 1
+  }
+}
+
+class async Main {
+  fn async main {
+    let out = STDOUT.new
+
+    # We take the desired width as the first argument, falling back to 80
+    # characters if none was given or the argument couldn't be parsed as a
+    # decimal number.
+    let mut max = env
+      .arguments
+      .opt(0)
+      .then(fn (v) { Int.parse(v, Format.Decimal) })
+      .or(80)
+
+    if max < 0 { max = 80 }
+
+    # This displays the formatted output, and draws a grey vertical line at the
+    # line limit.
+    render(max).split('\n').each(fn (line) {
+      let size = line.chars.count
+      let line = if size < max { line + ' '.repeat(max - size) } else { line }
+
+      line.chars.each_with_index(fn (i, c) {
+        # The escape sequence here uses a 24-bits color sequence. See
+        # https://github.com/termstandard/colors for more details.
+        out.write_string(
+          if i == (max - 1) { '\e[48;2;230;230;230m${c}\e[0m' } else { c },
+        )
+      })
+      out.write_string('\n')
+    })
+  }
+
+  fn render(max: Int) -> String {
+    let gen = Generator.new(max)
+    let build = Builder.new
+    let node = build.call(
+      'foo',
+      [
+        Node.Text('1000000000000000000000000000000'),
+        build.call(
+          'bar',
+          [
+            Node.Text('2000000000000000000000000000000'),
+            build.string('this is a string'),
+            build.call('without_arguments', []),
+          ],
+        ),
+      ],
+    )
+
+    gen.generate(node)
+    gen.into_string
+  }
+}
