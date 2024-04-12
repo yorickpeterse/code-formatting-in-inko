@@ -156,8 +156,8 @@ class Generator {
   let @size: Int
 
   # The maximum number of characters we allow per line. If your formatter
-  # doesn't users to change this value, you probably want to turn this into a
-  # constant instead.
+  # doesn't allow users to change this value, you probably want to turn this
+  # into a constant instead.
   let @max: Int
 
   # A hash set containing all the groups that need to be wrapped.
