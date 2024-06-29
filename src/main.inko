@@ -166,13 +166,13 @@ class Generator {
   # This method returns a new `Generator` in its default state, using `max` as
   # the line limit.
   fn static new(max: Int) -> Generator {
-    Generator {
-      @buffer = StringBuffer.new,
-      @indent = 0,
-      @size = 0,
-      @max = max,
-      @wrapped = Set.new,
-    }
+    Generator(
+      buffer: StringBuffer.new,
+      indent: 0,
+      size: 0,
+      max: max,
+      wrapped: Set.new,
+    )
   }
 
   # The entry point for generating the formatted code for a single node. This is
@@ -257,7 +257,7 @@ class Builder {
   let @id: Int
 
   fn static new -> Builder {
-    Builder { @id = 0 }
+    Builder(0)
   }
 
   # An example method for formatting a simple function call with zero or more

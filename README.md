@@ -11,12 +11,12 @@ needed.
 
 # Requirements
 
-- Inko `main` (for now)
+- Inko 0.15.0 or newer
 
 # Usage
 
-If you have a copy of Inko's `main` branch installed, you can simply run the
-program like so, where `WIDTH` is the desired line width:
+Using Inko 0.15.0 or newer, run the program like so, where `WIDTH` is the
+desired line width:
 
 ```bash
 inko run src/main.inko WIDTH
@@ -26,10 +26,10 @@ If you don't have or don't want to install Inko, you can also use Docker/Podman:
 
 ```bash
 # When using Docker:
-docker run --rm --volume ./src:/src:z ghcr.io/inko-lang/inko:main inko run /src/main.inko WIDTH
+docker run --rm --volume ./src:/src:z ghcr.io/inko-lang/inko:latest inko run /src/main.inko WIDTH
 
 # When using Podman:
-podman run --rm --volume ./src:/src:z ghcr.io/inko-lang/inko:main inko run /src/main.inko WIDTH
+podman run --rm --volume ./src:/src:z ghcr.io/inko-lang/inko:latest inko run /src/main.inko WIDTH
 ```
 
 The output should be something along the lines of the following:
